@@ -1,0 +1,24 @@
+#version 450
+
+// Matches the interleaved Vertex struct in Mesh.h
+layout(location = 0) in vec3 inPosition;
+layout(location = 1) in float inUvX;
+layout(location = 2) in vec3 inNormal;
+layout(location = 3) in float inUvY;
+layout(location = 4) in vec4 inColor;
+
+layout(push_constant) uniform PushConstants {
+    mat4 mvp;
+} push;
+
+layout(location = 0) out vec3 outNormal;
+layout(location = 1) out vec2 outUV;
+layout(location = 2) out vec4 outColor;
+
+void main()
+{
+    gl_Position = push.mvp * vec4(inPosition, 1.0);
+    outNormal   = inNormal;
+    outUV       = vec2(inUvX, inUvY);
+    outColor    = inColor;
+}

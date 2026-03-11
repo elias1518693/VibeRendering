@@ -3,6 +3,7 @@
 #include "Swapchain.h"
 
 #include <GLFW/glfw3.h>
+#include <glm/gtc/type_ptr.hpp>
 #include <spdlog/spdlog.h>
 
 #include <array>
@@ -12,17 +13,18 @@ Renderer::Renderer(const VulkanContext& ctx, const Swapchain& swapchain)
     : m_ctx(ctx)
 {
     createFrameData(swapchain.imageCount());
-    spdlog::info("Renderer initialized ({} frames in flight, {} acquire semaphores)",
-        k_maxFramesInFlight, m_imageAvailableSems.size());
+    createDepthImage(swapchain.extent());
+    spdlog::info("Renderer initialized ({} frames in flight)", k_maxFramesInFlight);
 }
 
 Renderer::~Renderer()
 {
+    destroyDepthImage();
     destroyFrameData();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Frame data: per-frame command pool, command buffer, semaphores, fence
+// Frame data
 // ─────────────────────────────────────────────────────────────────────────────
 
 void Renderer::createFrameData(uint32_t swapchainImageCount)
@@ -32,13 +34,11 @@ void Renderer::createFrameData(uint32_t swapchainImageCount)
         .flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
         .queueFamilyIndex = m_ctx.graphicsQueueFamily()
     };
-
     VkCommandBufferAllocateInfo cbAllocInfo{
         .sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
         .commandBufferCount = 1
     };
-
     VkSemaphoreCreateInfo semInfo{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkFenceCreateInfo fenceInfo{
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
@@ -49,17 +49,13 @@ void Renderer::createFrameData(uint32_t swapchainImageCount)
     {
         if (vkCreateCommandPool(m_ctx.device(), &poolInfo, nullptr, &frame.commandPool) != VK_SUCCESS)
             throw std::runtime_error("Failed to create command pool");
-
         cbAllocInfo.commandPool = frame.commandPool;
         if (vkAllocateCommandBuffers(m_ctx.device(), &cbAllocInfo, &frame.commandBuffer) != VK_SUCCESS)
             throw std::runtime_error("Failed to allocate command buffer");
-
         if (vkCreateFence(m_ctx.device(), &fenceInfo, nullptr, &frame.inFlight) != VK_SUCCESS)
             throw std::runtime_error("Failed to create fence");
     }
 
-    // One semaphore per swapchain image for both acquire and render-finished.
-    // This guarantees neither semaphore is reused while the WSI still holds it.
     m_imageAvailableSems.resize(swapchainImageCount);
     m_renderFinishedSems.resize(swapchainImageCount);
     for (uint32_t i = 0; i < swapchainImageCount; ++i)
@@ -79,7 +75,6 @@ void Renderer::destroyFrameData()
         vkDestroySemaphore(m_ctx.device(), sem, nullptr);
     m_imageAvailableSems.clear();
     m_renderFinishedSems.clear();
-
     for (auto& frame : m_frames)
     {
         vkDestroyFence(m_ctx.device(), frame.inFlight, nullptr);
@@ -88,13 +83,33 @@ void Renderer::destroyFrameData()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Image layout transition using Vulkan 1.3 Synchronization2
+// Depth image
 // ─────────────────────────────────────────────────────────────────────────────
 
-void Renderer::transitionImage(VkCommandBuffer cmd,
-                               VkImage         image,
-                               VkImageLayout   oldLayout,
-                               VkImageLayout   newLayout)
+void Renderer::createDepthImage(VkExtent2D extent)
+{
+    m_depthImage = m_ctx.createImage(extent, k_depthFormat,
+        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+}
+
+void Renderer::destroyDepthImage()
+{
+    if (m_depthImage.image != VK_NULL_HANDLE)
+    {
+        m_ctx.destroyImage(m_depthImage);
+        m_depthImage = {};
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Image layout transition (Sync2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+void Renderer::transitionImage(VkCommandBuffer    cmd,
+                               VkImage            image,
+                               VkImageLayout      oldLayout,
+                               VkImageLayout      newLayout,
+                               VkImageAspectFlags aspectMask)
 {
     VkImageMemoryBarrier2 barrier{
         .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
@@ -106,31 +121,30 @@ void Renderer::transitionImage(VkCommandBuffer cmd,
         .newLayout        = newLayout,
         .image            = image,
         .subresourceRange = {
-            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+            .aspectMask     = aspectMask,
             .baseMipLevel   = 0,
             .levelCount     = 1,
             .baseArrayLayer = 0,
             .layerCount     = 1
         }
     };
-
     VkDependencyInfo depInfo{
         .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
         .imageMemoryBarrierCount = 1,
         .pImageMemoryBarriers    = &barrier
     };
-
     vkCmdPipelineBarrier2(cmd, &depInfo);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Record a command buffer: transition → dynamic rendering clear → transition
+// Command buffer recording
 // ─────────────────────────────────────────────────────────────────────────────
 
-void Renderer::recordCommandBuffer(VkCommandBuffer cmd,
-                                   VkImage         image,
-                                   VkImageView     imageView,
-                                   VkExtent2D      extent)
+void Renderer::recordCommandBuffer(VkCommandBuffer    cmd,
+                                   VkImage            colorImage,
+                                   VkImageView        colorView,
+                                   VkExtent2D         extent,
+                                   const DrawContext& draw)
 {
     VkCommandBufferBeginInfo beginInfo{
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -138,21 +152,29 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd,
     };
     vkBeginCommandBuffer(cmd, &beginInfo);
 
-    // 1. UNDEFINED → COLOR_ATTACHMENT_OPTIMAL
-    transitionImage(cmd, image,
-        VK_IMAGE_LAYOUT_UNDEFINED,
-        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    // Transitions
+    transitionImage(cmd, colorImage,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    transitionImage(cmd, m_depthImage.image,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+        VK_IMAGE_ASPECT_DEPTH_BIT);
 
-    // 2. Dynamic rendering — no VkRenderPass needed!
-    VkClearColorValue clearColor{.float32 = {0.08f, 0.04f, 0.18f, 1.0f}}; // deep vibe purple
-
-    VkRenderingAttachmentInfo colorAttachment{
+    // Attachments
+    VkRenderingAttachmentInfo colorAtt{
         .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .imageView   = imageView,
+        .imageView   = colorView,
         .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
         .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
-        .clearValue  = {.color = clearColor}
+        .clearValue  = {.color = {.float32 = {0.08f, 0.04f, 0.18f, 1.0f}}}
+    };
+    VkRenderingAttachmentInfo depthAtt{
+        .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView   = m_depthImage.imageView,
+        .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+        .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp     = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .clearValue  = {.depthStencil = {.depth = 1.0f}}
     };
 
     VkRenderingInfo renderingInfo{
@@ -160,38 +182,67 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd,
         .renderArea           = {.offset = {0, 0}, .extent = extent},
         .layerCount           = 1,
         .colorAttachmentCount = 1,
-        .pColorAttachments    = &colorAttachment
+        .pColorAttachments    = &colorAtt,
+        .pDepthAttachment     = &depthAtt
     };
 
     vkCmdBeginRendering(cmd, &renderingInfo);
-    // Future: bind pipeline and issue draw calls here
+
+    if (draw.pipeline != VK_NULL_HANDLE && !draw.meshes.empty())
+    {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, draw.pipeline);
+
+        VkViewport viewport{
+            .x = 0.0f, .y = 0.0f,
+            .width    = static_cast<float>(extent.width),
+            .height   = static_cast<float>(extent.height),
+            .minDepth = 0.0f,
+            .maxDepth = 1.0f
+        };
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        VkRect2D scissor{{0, 0}, extent};
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        vkCmdPushConstants(cmd, draw.pipelineLayout,
+            VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4),
+            glm::value_ptr(draw.mvp));
+
+        for (uint32_t i = 0; i < static_cast<uint32_t>(draw.meshes.size()); ++i)
+        {
+            const auto& mesh = draw.meshes[i];
+
+            if (!draw.descriptorSets.empty())
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    draw.pipelineLayout, 0, 1, &draw.descriptorSets[i], 0, nullptr);
+
+            VkDeviceSize offset = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertexBuffer.buffer, &offset);
+            vkCmdBindIndexBuffer(cmd, mesh.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
+        }
+    }
+
     vkCmdEndRendering(cmd);
 
-    // 3. COLOR_ATTACHMENT_OPTIMAL → PRESENT_SRC_KHR
-    transitionImage(cmd, image,
-        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    transitionImage(cmd, colorImage,
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 
     vkEndCommandBuffer(cmd);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// drawFrame: acquire → record → submit → present
+// drawFrame
 // ─────────────────────────────────────────────────────────────────────────────
 
-void Renderer::drawFrame(Swapchain& swapchain, GLFWwindow* window, bool framebufferResized)
+void Renderer::drawFrame(Swapchain& swapchain, GLFWwindow* window,
+                         bool framebufferResized, const DrawContext& draw)
 {
     FrameData& frame = m_frames[m_currentFrame];
-
-    // Wait for this frame slot's previous GPU work to finish
     vkWaitForFences(m_ctx.device(), 1, &frame.inFlight, VK_TRUE, UINT64_MAX);
 
-    // Pick the next imageAvailable semaphore from the rotating pool.
-    // Cycling through imageCount semaphores ensures we never reuse one still held by the WSI.
     VkSemaphore acquireSem = m_imageAvailableSems[m_acquireSemIdx];
     m_acquireSemIdx = (m_acquireSemIdx + 1) % static_cast<uint32_t>(m_imageAvailableSems.size());
 
-    // Acquire next swapchain image
     uint32_t imageIndex = 0;
     VkResult acquireResult = vkAcquireNextImageKHR(
         m_ctx.device(), swapchain.handle(), UINT64_MAX,
@@ -200,25 +251,21 @@ void Renderer::drawFrame(Swapchain& swapchain, GLFWwindow* window, bool framebuf
     if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR)
     {
         swapchain.recreate(window);
+        destroyDepthImage();
+        createDepthImage(swapchain.extent());
         return;
-        // NOTE: fence NOT reset here — still signaled, correct because
-        //       we never submitted work to it this frame.
     }
     if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR)
         throw std::runtime_error("Failed to acquire swapchain image");
 
-    // Only reset the fence once we know we'll submit work
     vkResetFences(m_ctx.device(), 1, &frame.inFlight);
-
-    // Record
     vkResetCommandPool(m_ctx.device(), frame.commandPool, 0);
+
     recordCommandBuffer(frame.commandBuffer,
         swapchain.images()[imageIndex],
         swapchain.imageViews()[imageIndex],
-        swapchain.extent());
+        swapchain.extent(), draw);
 
-    // Submit: wait on the semaphore used for this acquire, signal the one for this image slot.
-    // Both indexed by imageIndex so they're never reused while the WSI holds them.
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo submitInfo{
         .sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -232,7 +279,6 @@ void Renderer::drawFrame(Swapchain& swapchain, GLFWwindow* window, bool framebuf
     };
     vkQueueSubmit(m_ctx.graphicsQueue(), 1, &submitInfo, frame.inFlight);
 
-    // Present
     VkSwapchainKHR swapchainHandle = swapchain.handle();
     VkPresentInfoKHR presentInfo{
         .sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -249,6 +295,8 @@ void Renderer::drawFrame(Swapchain& swapchain, GLFWwindow* window, bool framebuf
         framebufferResized)
     {
         swapchain.recreate(window);
+        destroyDepthImage();
+        createDepthImage(swapchain.extent());
     }
     else if (presentResult != VK_SUCCESS)
     {
