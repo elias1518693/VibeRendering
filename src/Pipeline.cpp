@@ -50,34 +50,43 @@ Pipeline::Pipeline(const VulkanContext&          ctx,
     VkShaderModule vertModule = loadShader(ctx.device(), vertSpv);
     VkShaderModule fragModule = loadShader(ctx.device(), fragSpv);
 
-    // ── Descriptor set layout: set 0, binding 0 = combined image sampler ────────
-    VkDescriptorSetLayoutBinding samplerBinding{
-        .binding         = 0,
-        .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .descriptorCount = 1,
-        .stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT
+    // ── Descriptor set layout: binding 0 = albedo, binding 1 = shadow map ───────
+    VkDescriptorSetLayoutBinding bindings[2]{
+        {
+            .binding         = 0,
+            .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT
+        },
+        {
+            .binding         = 1,
+            .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT
+        }
     };
     VkDescriptorSetLayoutCreateInfo setLayoutInfo{
         .sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 1,
-        .pBindings    = &samplerBinding
+        .bindingCount = 2,
+        .pBindings    = bindings
     };
     if (vkCreateDescriptorSetLayout(ctx.device(), &setLayoutInfo, nullptr, &m_descriptorSetLayout) != VK_SUCCESS)
         throw std::runtime_error("Failed to create descriptor set layout");
 
-    // ── Push constants: one mat4 for MVP ──────────────────────────────────────
-    VkPushConstantRange pushRange{
-        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
-        .offset     = 0,
-        .size       = sizeof(float) * 16   // mat4
+    // ── Push constants:
+    //    VERTEX  [0..63]   — mat4 mvp
+    //    FRAGMENT[64..103] — vec4 lightPos + 6 floats (ambient, diffuse, shadowBias, pcfRadius, attLin, attQuad)
+    VkPushConstantRange pushRanges[2]{
+        {.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,   .offset = 0,  .size = 64},
+        {.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 64, .size = 40}
     };
 
     VkPipelineLayoutCreateInfo layoutInfo{
         .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount         = 1,
         .pSetLayouts            = &m_descriptorSetLayout,
-        .pushConstantRangeCount = 1,
-        .pPushConstantRanges    = &pushRange
+        .pushConstantRangeCount = 2,
+        .pPushConstantRanges    = pushRanges
     };
     if (vkCreatePipelineLayout(ctx.device(), &layoutInfo, nullptr, &m_layout) != VK_SUCCESS)
         throw std::runtime_error("Failed to create pipeline layout");

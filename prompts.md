@@ -33,3 +33,19 @@ Every prompt given during this project, in order.
 14. write in a prompts.md file every prompt I have given you so far, and every future promt that is added
 
 15. update the readme to include this
+
+16. make it possible to fly through the scene using wasd
+
+17. implement shadow mapping with pcf
+
+18. continue
+
+19. place one bright point light in the middle of the scene to show the shadows
+
+20. make the shadow map omnidirectional with cube maps
+
+21. place the point light higher and reach far
+
+22. include imgui and offer a debug menu where I can edit the settings
+
+23. make the light reach 1000

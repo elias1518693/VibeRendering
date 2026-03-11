@@ -9,6 +9,10 @@
     "vulkan-memory-allocator",
     "vulkan-headers",
     "fastgltf",
-    "stb"
+    "stb",
+    {
+      "name": "imgui",
+      "features": ["glfw-binding", "vulkan-binding"]
+    }
   ]
 }

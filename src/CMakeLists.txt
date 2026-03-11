@@ -6,6 +6,7 @@ find_package(vk-bootstrap CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 find_package(fastgltf CONFIG REQUIRED)
 find_package(Stb REQUIRED)
+find_package(imgui CONFIG REQUIRED)
 
 add_executable(VibeRendering
     main.cpp
@@ -25,6 +26,7 @@ target_link_libraries(VibeRendering PRIVATE
     vk-bootstrap::vk-bootstrap
     GPUOpen::VulkanMemoryAllocator
     fastgltf::fastgltf
+    imgui::imgui
 )
 
 target_compile_definitions(VibeRendering PRIVATE
@@ -55,6 +57,8 @@ file(MAKE_DIRECTORY ${SHADER_BIN_DIR})
 set(SHADERS
     ${SHADER_SRC_DIR}/mesh.vert
     ${SHADER_SRC_DIR}/mesh.frag
+    ${SHADER_SRC_DIR}/shadow_cube.vert
+    ${SHADER_SRC_DIR}/shadow_cube.frag
 )
 
 foreach(SHADER IN LISTS SHADERS)
